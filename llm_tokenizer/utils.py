@@ -145,6 +145,34 @@ def ChatMLSFT(conversations, inference = False):#[{"role": "user", "content": te
         full_prompt += "<|im_start|>assistant\n"
     return full_prompt
 
+class SimpleStreamDecoder:
+    def __init__(self, tokenizer): 
+        self.tokenizer = tokenizer
+        self.cache = []
+    
+    def decode(self, token_id: int) -> str:
+        self.cache.append(token_id)
+        result = self.tokenizer.decode(self.cache)
+        
+        # 检查结果末尾是否有替换字符
+        if result.endswith('�'):
+            # 有未完成的序列，返回空字符串
+            return ""
+        else:
+            # 有完整序列，清空缓存并返回结果
+            text = result
+            self.cache = []
+            return text
+    
+    def flush(self) -> str:
+        if not self.cache:
+            return ""
+        
+        # 强制解码剩余内容
+        result = self.tokenizer.decode(self.cache, errors='replace')
+        self.cache = []
+        return result
+
 if __name__ == '__main__':
     c = [{"role": "user", "content": "你来自哪里？"}, {"role": "assistant", "content": "我来自地球"}]
     print(ChatMLSFT(c))
