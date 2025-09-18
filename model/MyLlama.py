@@ -1,8 +1,9 @@
 import dataclasses
+from typing import Optional, Union, Generator, Tuple
 
 @dataclasses.dataclass
 class LLMConfig:
-    model_type = "minimind"
+    model_type = "llama"
 
     def __init__(
             self,
@@ -10,11 +11,11 @@ class LLMConfig:
             bos_token_id: int = 1,
             eos_token_id: int = 2,
             # hidden_act: str = 'silu',
-            hidden_size: int = 512,
+            hidden_size: int = 768,
             intermediate_size: int = None,
             max_position_embeddings: int = 32768,
             num_heads: int = 8,
-            num_hidden_layers: int = 8,
+            num_hidden_layers: int = 16,
             num_key_value_heads: int = 2,
             vocab_size: int = 6400,
             rms_norm_eps: float = 1e-05,
@@ -180,11 +181,11 @@ class Attention(nn.Module):
         if not self.flash:
             # 若不支持Flash Attention，则使用手动实现的注意力机制，并设置mask。
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # 创建一个上三角矩阵，用于遮蔽未来信息。
-            mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
-            mask = torch.triu(mask, diagonal=1)
-            # 注册为模型的缓冲区
-            self.register_buffer("mask", mask)
+        # 创建一个上三角矩阵，用于遮蔽未来信息。
+        mask = torch.full((1, 1, 1024, 1024), float("-inf"))
+        mask = torch.triu(mask, diagonal=1)
+        # 注册为模型的缓冲区
+        self.register_buffer("mask", mask)
 
     def forward(self,
                 x: torch.Tensor,
@@ -217,7 +218,7 @@ class Attention(nn.Module):
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
 
-        if self.flash:
+        if self.flash and seq_len != 1:
             dropout_p = self.dropout if self.training else 0.0
             attn_mask = None
             if attention_mask is not None:
@@ -346,7 +347,7 @@ class Transformer(nn.Module):
         }
 
     @torch.inference_mode()
-    def generate(
+    def generate_stream(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
@@ -358,9 +359,9 @@ class Transformer(nn.Module):
         pad_token_id: Optional[int] = None,
         eos_token_id: Optional[int] = None,
         **kwargs
-    ) -> torch.Tensor:
+    ) -> Generator[torch.Tensor, None, None]:  # 返回类型改为生成器
         """
-        使用KV Cache的生成函数
+        使用KV Cache的流式生成函数
         
         参数:
             input_ids: 起始输入序列 [batch_size, seq_len]
@@ -373,7 +374,7 @@ class Transformer(nn.Module):
             eos_token_id: 结束token ID
             
         返回:
-            生成的序列 [batch_size, generated_seq_len]
+            生成器，每次yield新生成的token [batch_size, 1]
         """
         index = input_ids.shape[1]
         # 初始化生成的序列和注意力掩码
@@ -382,6 +383,9 @@ class Transformer(nn.Module):
         
         # 如果没有提供eos_token_id，则一直生成直到max_length
         stopping_criteria = eos_token_id is not None
+
+        # 首先yield初始输入（如果需要）
+        # yield generated
         
         # 生成循环
         for _ in range(max_length):
@@ -394,7 +398,7 @@ class Transformer(nn.Module):
             outputs = self(
                 input_ids=input_ids,
                 past_key_values=past_key_values,
-                attention_mask = attention_mask,
+                attention_mask=attention_mask,
                 use_cache=True,
             )
             
@@ -435,11 +439,133 @@ class Transformer(nn.Module):
             # 将新token添加到生成的序列中
             generated = torch.cat([generated, next_tokens], dim=-1)
             
+            # 更新attention_mask（如果需要）
+            if attention_mask is not None:
+                attention_mask = torch.cat([
+                    attention_mask, 
+                    torch.ones((attention_mask.shape[0], 1), device=attention_mask.device)
+                ], dim=-1)
+            
+            # 流式输出：yield新生成的token
+            yield next_tokens
+            
             # 检查是否应该停止生成
-            if stopping_criteria and (next_tokens == eos_token_id).all():
+            if stopping_criteria and torch.any(next_tokens == eos_token_id):
+                break
+    
+    @torch.inference_mode()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        max_length: int = 100,
+        temperature: float = 1.0,
+        do_sample: bool = True,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        pad_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+        **kwargs
+    ) -> Union[torch.Tensor, Generator[torch.Tensor, None, None]]:
+        """
+        使用KV Cache的生成函数，支持流式和非流式输出
+        
+        参数:
+            input_ids: 起始输入序列 [batch_size, seq_len]
+            max_length: 生成的最大长度
+            temperature: 温度参数，控制随机性
+            do_sample: 是否采样
+            top_k: top-k采样参数
+            top_p: top-p(核)采样参数
+            pad_token_id: 填充token ID
+            eos_token_id: 结束token ID
+            stream: 是否使用流式输出
+            
+        返回:
+            如果stream=False: 返回完整生成的序列 [batch_size, generated_seq_len]
+            如果stream=True: 返回生成器，每次yield新生成的token [batch_size, 1]
+        """
+        index = input_ids.shape[1]
+        # 初始化生成的序列和注意力掩码
+        generated = input_ids
+        past_key_values = None
+        
+        # 如果没有提供eos_token_id，则一直生成直到max_length
+        stopping_criteria = eos_token_id is not None
+        
+        # 存储所有生成的token（用于非流式模式）
+        all_generated_tokens = []
+        
+        # 生成循环
+        for _ in range(max_length):
+            # 准备当前输入（只使用最后一个token）
+            if past_key_values is not None:
+                # 如果有past_key_values，只需要最后一个token
+                input_ids = generated[:, -1].unsqueeze(-1)
+            
+            # 前向传播，使用past_key_values
+            outputs = self(
+                input_ids=input_ids,
+                past_key_values=past_key_values,
+                attention_mask=attention_mask,
+                use_cache=True,
+            )
+            
+            # 更新past_key_values
+            past_key_values = outputs["past_key_values"]
+            
+            # 获取下一个token的logits
+            next_token_logits = outputs["logits"][:, -1, :] / temperature
+            
+            # 应用top-k/top-p过滤
+            if top_k is not None:
+                # top-k过滤
+                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                next_token_logits[indices_to_remove] = -float("Inf")
+            
+            if top_p is not None and top_p < 1.0:
+                # top-p（核）过滤
+                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                
+                # 移除累积概率高于top_p的token
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # shift右移，保证第一个token总被保留
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                
+                for idx in range(next_token_logits.shape[0]):
+                    indices_to_remove = sorted_indices[idx, sorted_indices_to_remove[idx]]
+                    next_token_logits[idx, indices_to_remove] = -float("Inf")
+            
+            # 采样下一个token
+            if do_sample:
+                probs = torch.softmax(next_token_logits, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1)
+            else:
+                next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            
+            # 将新token添加到生成的序列中
+            generated = torch.cat([generated, next_tokens], dim=-1)
+            
+            # 更新attention_mask（如果需要）
+            if attention_mask is not None:
+                attention_mask = torch.cat([
+                    attention_mask, 
+                    torch.ones((attention_mask.shape[0], 1), device=attention_mask.device)
+                ], dim=-1)
+            
+            
+            # 存储所有生成的token（用于非流式模式）
+            all_generated_tokens.append(next_tokens)
+            
+            # 检查是否应该停止生成
+            if stopping_criteria and torch.any(next_tokens == eos_token_id):
                 break
         
-        return generated
+        # 非流式输出：返回完整生成的序列
+        # return generated
+        return all_generated_tokens  
 
 if __name__ == "__main__":
     config = LLMConfig()
