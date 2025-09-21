@@ -132,10 +132,15 @@ def ChatMLSFT(conversations, inference = False):#[{"role": "user", "content": te
     '''
     for dataset training
     '''
-    sys_promt = "<|im_start|>system\nYou are a helpful assistant<|im_end|>\n"
+    if conversations[0]["role"] == "system":
+        sys_prompt = f"<|im_start|>system\n{conversations[0]['content']}<|im_end|>\n"
+    else:
+        sys_prompt = None
+    if sys_prompt is None:
+        sys_prompt = "<|im_start|>system\nYou are a helpful assistant<|im_end|>\n"
     user_promt = "<|im_start|>user\n{}<|im_end|>\n"
     assistant_promt = "<|im_start|>assistant\n{}<|im_end|>\n"
-    full_prompt = sys_promt
+    full_prompt = sys_prompt
     for conv in conversations:
         if conv["role"] == "user":
             full_prompt += user_promt.format(conv["content"])
