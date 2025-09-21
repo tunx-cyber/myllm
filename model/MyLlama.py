@@ -557,7 +557,7 @@ class Transformer(nn.Module):
             
             
             # 存储所有生成的token（用于非流式模式）
-            all_generated_tokens.append(next_tokens)
+            all_generated_tokens.append(next_tokens.item())
             
             # 检查是否应该停止生成
             if stopping_criteria and torch.any(next_tokens == eos_token_id):
